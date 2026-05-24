@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""GUI tool to sort Salesforce metadata XML elements for stable diffs."""
+
+from __future__ import annotations
+
+import threading
+import tkinter as tk
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+
+KEY_CHILDREN = (
+    "fullName",
+    "name",
+    "field",
+    "fieldName",
+    "label",
+    "valueName",
+    "value",
+    "recordType",
+    "profile",
+    "application",
+    "tab",
+    "type",
+)
+
+
+def local_name(tag: str) -> str:
+    if tag.startswith("{"):
+        return tag.rsplit("}", 1)[1]
+    return tag
+
+
+def namespace_uri(tag: str) -> str | None:
+    if tag.startswith("{"):
+        return tag[1:].split("}", 1)[0]
+    return None
+
+
+def element_text(element: ET.Element) -> str:
+    return (element.text or "").strip()
+
+
+def first_child_text(element: ET.Element, child_name: str) -> str:
+    for child in element:
+        if local_name(child.tag) == child_name:
+            return element_text(child)
+    return ""
+
+
+def element_sort_key(element: ET.Element) -> tuple[str, str, str]:
+    tag_name = local_name(element.tag).lower()
+
+    for child_name in KEY_CHILDREN:
+        value = first_child_text(element, child_name)
+        if value:
+            return (tag_name, child_name, value.lower())
+
+    text = element_text(element)
+    if text:
+        return (tag_name, "text", text.lower())
+
+    return (tag_name, "xml", ET.tostring(element, encoding="unicode"))
+
+
+def sort_attributes(element: ET.Element) -> None:
+    if len(element.attrib) > 1:
+        sorted_attributes = dict(sorted(element.attrib.items()))
+        element.attrib.clear()
+        element.attrib.update(sorted_attributes)
+
+
+def sort_tree(element: ET.Element) -> None:
+    sort_attributes(element)
+
+    for child in element:
+        sort_tree(child)
+
+    children = list(element)
+    if len(children) > 1:
+        element[:] = sorted(children, key=element_sort_key)
+
+
+def read_xml(path: Path) -> ET.ElementTree:
+    parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+    return ET.parse(path, parser=parser)
+
+
+def sorted_xml_bytes(path: Path) -> bytes:
+    tree = read_xml(path)
+    root = tree.getroot()
+    namespace = namespace_uri(root.tag)
+    if namespace:
+        ET.register_namespace("", namespace)
+
+    sort_tree(root)
+    ET.indent(root, space="    ")
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True) + b"\n"
+
+
+def iter_xml_files(source_folder: Path) -> list[Path]:
+    return sorted(path for path in source_folder.rglob("*.xml") if path.is_file())
+
+
+def sort_metadata_folder(source_folder: Path, output_folder: Path) -> tuple[int, list[str]]:
+    files = iter_xml_files(source_folder)
+    messages: list[str] = []
+    success_count = 0
+
+    for source_path in files:
+        relative_path = source_path.relative_to(source_folder)
+        output_path = output_folder / relative_path
+
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(sorted_xml_bytes(source_path))
+            messages.append(f"OK: {relative_path}")
+            success_count += 1
+        except ET.ParseError as error:
+            messages.append(f"XML解析エラー: {relative_path} ({error})")
+        except OSError as error:
+            messages.append(f"出力エラー: {relative_path} ({error})")
+
+    return success_count, messages
+
+
+class SalesforceMetadataSorterApp:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("Salesforce メタデータ XML ソートツール")
+        self.root.geometry("900x520")
+        self.root.minsize(760, 420)
+
+        self.source_folder = tk.StringVar()
+        self.output_folder = tk.StringVar()
+        self.status_text = tk.StringVar(value="対象フォルダーと出力フォルダーを選択してください。")
+
+        self._build_layout()
+
+    def _build_layout(self) -> None:
+        container = ttk.Frame(self.root, padding=16)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(1, weight=1)
+        container.rowconfigure(4, weight=1)
+
+        ttk.Label(container, text="対象フォルダー").grid(row=0, column=0, sticky="w")
+        ttk.Entry(container, textvariable=self.source_folder).grid(
+            row=0, column=1, sticky="ew", padx=8, pady=6
+        )
+        ttk.Button(container, text="対象選択", command=self.select_source_folder).grid(
+            row=0, column=2, sticky="ew"
+        )
+
+        ttk.Label(container, text="出力フォルダー").grid(row=1, column=0, sticky="w")
+        ttk.Entry(container, textvariable=self.output_folder).grid(
+            row=1, column=1, sticky="ew", padx=8, pady=6
+        )
+        ttk.Button(container, text="出力フォルダー", command=self.select_output_folder).grid(
+            row=1, column=2, sticky="ew"
+        )
+
+        self.run_button = ttk.Button(container, text="実行", command=self.run_sort)
+        self.run_button.grid(row=2, column=2, sticky="ew", pady=(8, 10))
+
+        ttk.Label(container, textvariable=self.status_text).grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(0, 6)
+        )
+
+        log_frame = ttk.Frame(container)
+        log_frame.grid(row=4, column=0, columnspan=3, sticky="nsew")
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+
+        self.log = tk.Text(log_frame, height=16, wrap="none")
+        self.log.grid(row=0, column=0, sticky="nsew")
+
+        scrollbar_y = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
+        scrollbar_y.grid(row=0, column=1, sticky="ns")
+        self.log.configure(yscrollcommand=scrollbar_y.set)
+
+    def select_source_folder(self) -> None:
+        folder = filedialog.askdirectory(title="ソート対象フォルダーを選択")
+        if folder:
+            self.source_folder.set(folder)
+
+    def select_output_folder(self) -> None:
+        folder = filedialog.askdirectory(title="出力フォルダーを選択")
+        if folder:
+            self.output_folder.set(folder)
+
+    def run_sort(self) -> None:
+        source_text = self.source_folder.get().strip()
+        output_text = self.output_folder.get().strip()
+
+        if not source_text or not Path(source_text).expanduser().is_dir():
+            messagebox.showerror("入力エラー", "有効な対象フォルダーを選択してください。")
+            return
+
+        if not output_text:
+            messagebox.showerror("入力エラー", "出力フォルダーを選択してください。")
+            return
+
+        source = Path(source_text).expanduser()
+        output = Path(output_text).expanduser()
+
+        if source.resolve() == output.resolve():
+            messagebox.showerror(
+                "入力エラー",
+                "対象フォルダーと出力フォルダーは別のフォルダーを選択してください。",
+            )
+            return
+
+        self.run_button.configure(state="disabled")
+        self.status_text.set("実行中...")
+        self.log.delete("1.0", "end")
+
+        thread = threading.Thread(target=self._run_sort_worker, args=(source, output), daemon=True)
+        thread.start()
+
+    def _run_sort_worker(self, source: Path, output: Path) -> None:
+        success_count, messages = sort_metadata_folder(source, output)
+        self.root.after(0, self._show_result, success_count, messages)
+
+    def _show_result(self, success_count: int, messages: list[str]) -> None:
+        if messages:
+            self.log.insert("end", "\n".join(messages))
+            self.log.insert("end", "\n")
+        else:
+            self.log.insert("end", "XMLファイルが見つかりませんでした。\n")
+
+        self.status_text.set(f"完了: {success_count} 件のXMLファイルを出力しました。")
+        self.run_button.configure(state="normal")
+
+
+def main() -> None:
+    root = tk.Tk()
+    app = SalesforceMetadataSorterApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
